@@ -14,12 +14,12 @@ from utils import sphere_hammersley_sequence
 
 BLENDER_LINK = 'https://download.blender.org/release/Blender3.0/blender-3.0.1-linux-x64.tar.xz'
 BLENDER_INSTALLATION_PATH = '/tmp'
-BLENDER_PATH = f'{BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64/blender'
+BLENDER_TMP_PATH = '/tmp/blender-3.0.1-linux-x64/blender'
+BLENDER_DOCKER_PATH = '/opt/blender-3.0.1-linux-x64/blender'
+BLENDER_PATH = BLENDER_DOCKER_PATH if os.path.exists(BLENDER_DOCKER_PATH) else BLENDER_TMP_PATH
 
 def _install_blender():
     if not os.path.exists(BLENDER_PATH):
-        os.system('sudo apt-get update')
-        os.system('sudo apt-get install -y libxrender1 libxi6 libxkbcommon-x11-0 libsm6')
         os.system(f'wget {BLENDER_LINK} -P {BLENDER_INSTALLATION_PATH}')
         os.system(f'tar -xvf {BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64.tar.xz -C {BLENDER_INSTALLATION_PATH}')
 
@@ -52,7 +52,7 @@ def _render(file_path, sha256, output_dir, num_views):
     if file_path.endswith('.blend'):
         args.insert(1, file_path)
     
-    call(args, stdout=DEVNULL, stderr=DEVNULL)
+    subprocess.run(args, check=True)
     
     if os.path.exists(os.path.join(output_folder, 'transforms.json')):
         return {'sha256': sha256, 'rendered': True}
