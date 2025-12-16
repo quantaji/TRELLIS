@@ -5,6 +5,7 @@ import math
 import os
 import re
 import sys
+from pathlib import Path
 from typing import *
 
 import bpy
@@ -33,7 +34,6 @@ EXT = {
     "BMP": "bmp",
     "HDR": "hdr",
     "TARGA": "tga",
-    "WEBP": "webp",
 }
 
 
@@ -44,10 +44,11 @@ def init_render(engine="CYCLES", resolution=512, geo_mode=False) -> None:
     bpy.context.scene.render.resolution_percentage = 100
 
     # MOD: match blender_render_img_mask.set_color_output(): WEBP + quality=100 + RGBA + transparent film
-    bpy.context.scene.render.image_settings.file_format = "WEBP"
+    bpy.context.scene.render.image_settings.file_format = "PNG"
     bpy.context.scene.render.image_settings.quality = 100
     bpy.context.scene.render.image_settings.color_mode = "RGBA"
     bpy.context.scene.render.film_transparent = True
+    bpy.context.scene.render.use_compositing = True
 
     bpy.context.scene.cycles.device = "GPU"
     # MOD: match blender_render_img_mask RENDER_SAMPLES=64 (geo_mode keeps 1)
@@ -64,7 +65,14 @@ def init_render(engine="CYCLES", resolution=512, geo_mode=False) -> None:
     bpy.context.preferences.addons["cycles"].preferences.compute_device_type = "CUDA"
 
 
-def init_nodes() -> Tuple[dict, dict]:
+def init_nodes(
+    output_folder: str,
+    save_depth: bool = False,
+    save_normal: bool = False,
+    save_albedo: bool = False,
+    save_mist: bool = False,
+    save_mask: bool = False,
+) -> Tuple[dict, dict]:
     # MOD: include save_mask in the early-exit condition
     if not any([save_depth, save_normal, save_albedo, save_mist, save_mask]):
         return {}, {}
@@ -72,7 +80,11 @@ def init_nodes() -> Tuple[dict, dict]:
     spec_nodes = {}
 
     bpy.context.scene.use_nodes = True
-    bpy.context.scene.view_layers["View Layer"].use_pass_object_index = save_mask
+    bpy.context.scene.view_layers["ViewLayer"].use_pass_z = save_depth
+    bpy.context.scene.view_layers["ViewLayer"].use_pass_normal = save_normal
+    bpy.context.scene.view_layers["ViewLayer"].use_pass_mist = save_mist
+    bpy.context.scene.view_layers["ViewLayer"].use_pass_diffuse_color = save_albedo
+    bpy.context.scene.view_layers["ViewLayer"].use_pass_cryptomatte_object = save_mask
 
     nodes = bpy.context.scene.node_tree.nodes
     links = bpy.context.scene.node_tree.links
@@ -83,7 +95,7 @@ def init_nodes() -> Tuple[dict, dict]:
 
     if save_depth:
         depth_file_output = nodes.new("CompositorNodeOutputFile")
-        depth_file_output.base_path = ""
+        depth_file_output.base_path = output_folder
         depth_file_output.file_slots[0].use_node_format = True
         depth_file_output.format.file_format = "PNG"
         depth_file_output.format.color_depth = "16"
@@ -103,7 +115,7 @@ def init_nodes() -> Tuple[dict, dict]:
 
     if save_normal:
         normal_file_output = nodes.new("CompositorNodeOutputFile")
-        normal_file_output.base_path = ""
+        normal_file_output.base_path = output_folder
         normal_file_output.file_slots[0].use_node_format = True
         normal_file_output.format.file_format = "OPEN_EXR"
         normal_file_output.format.color_mode = "RGB"
@@ -115,7 +127,7 @@ def init_nodes() -> Tuple[dict, dict]:
 
     if save_albedo:
         albedo_file_output = nodes.new("CompositorNodeOutputFile")
-        albedo_file_output.base_path = ""
+        albedo_file_output.base_path = output_folder
         albedo_file_output.file_slots[0].use_node_format = True
         albedo_file_output.format.file_format = "PNG"
         albedo_file_output.format.color_mode = "RGBA"
@@ -134,7 +146,7 @@ def init_nodes() -> Tuple[dict, dict]:
         bpy.data.worlds["World"].mist_settings.depth = 10
 
         mist_file_output = nodes.new("CompositorNodeOutputFile")
-        mist_file_output.base_path = ""
+        mist_file_output.base_path = output_folder
         mist_file_output.file_slots[0].use_node_format = True
         mist_file_output.format.file_format = "PNG"
         mist_file_output.format.color_mode = "BW"
@@ -145,15 +157,64 @@ def init_nodes() -> Tuple[dict, dict]:
         outputs["mist"] = mist_file_output
 
     if save_mask:
-        # MOD: a single EXR mask per view, pixel value = obj.pass_index (0 = background)
+
+        part_objs = sorted(
+            [o for o in bpy.context.scene.objects if o.type == "MESH" and o.name.startswith("part_")],
+            key=lambda o: o.name,
+        )
+
+        # 逐个 part：matte -> (matte > 0) -> * part_id -> max 归约
+        acc = None
+        for idx, obj in enumerate(part_objs):
+            part_id = float(idx + 1)  # 与原版 format_mask_output 的 i+1 对齐（背景0）:contentReference[oaicite:8]{index=8}
+
+            crypto = nodes.new("CompositorNodeCryptomatteV2")
+            crypto.matte_id = obj.name
+
+            # 重要：给 Cryptomatte 一个 Image 输入（让它从渲染结果里读 crypto 元数据）
+            links.new(render_layers.outputs["Image"], crypto.inputs["Image"])
+
+            gt = nodes.new("CompositorNodeMath")
+            gt.operation = "GREATER_THAN"
+            gt.inputs[1].default_value = 0.0
+            links.new(crypto.outputs["Matte"], gt.inputs[0])
+
+            mul = nodes.new("CompositorNodeMath")
+            mul.operation = "MULTIPLY"
+            mul.inputs[1].default_value = part_id
+            links.new(gt.outputs[0], mul.inputs[0])
+
+            if acc is None:
+                acc = mul
+            else:
+                mx = nodes.new("CompositorNodeMath")
+                mx.operation = "MAXIMUM"
+                links.new(acc.outputs[0], mx.inputs[0])
+                links.new(mul.outputs[0], mx.inputs[1])
+                acc = mx
+
+        # acc 输出是单通道 Value。为了“3通道 mask”，复制到 RGB。
+        combine = nodes.new("CompositorNodeCombRGBA")
+        combine.inputs["A"].default_value = 1.0
+
+        if acc is None:
+            # 没有任何 part：全 0
+            combine.inputs["R"].default_value = 0.0
+            combine.inputs["G"].default_value = 0.0
+            combine.inputs["B"].default_value = 0.0
+        else:
+            links.new(acc.outputs[0], combine.inputs["R"])
+            links.new(acc.outputs[0], combine.inputs["G"])
+            links.new(acc.outputs[0], combine.inputs["B"])
+
         mask_file_output = nodes.new("CompositorNodeOutputFile")
-        mask_file_output.base_path = ""
+        mask_file_output.base_path = output_folder
         mask_file_output.file_slots[0].use_node_format = True
         mask_file_output.format.file_format = "OPEN_EXR"
         mask_file_output.format.color_depth = "32"
-        mask_file_output.format.color_mode = "BW"
+        mask_file_output.format.color_mode = "RGB"  # 三通道
 
-        links.new(render_layers.outputs["IndexOB"], mask_file_output.inputs[0])
+        links.new(combine.outputs["Image"], mask_file_output.inputs[0])
         outputs["mask"] = mask_file_output
 
     return outputs, spec_nodes
@@ -186,14 +247,7 @@ def init_camera() -> None:
     cam = bpy.data.objects.new("Camera", bpy.data.cameras.new("Camera"))
     bpy.context.collection.objects.link(cam)
     bpy.context.scene.camera = cam
-    cam.data.sensor_height = cam.data.sensor_width = 32
-    cam_constraint = cam.constraints.new(type="TRACK_TO")
-    cam_constraint.track_axis = "TRACK_NEGATIVE_Z"
-    cam_constraint.up_axis = "UP_Y"
-    cam_empty = bpy.data.objects.new("Empty", None)
-    cam_empty.location = (0, 0, 0)
-    bpy.context.scene.collection.objects.link(cam_empty)
-    cam_constraint.target = cam_empty
+    cam.data.sensor_width = 36
     return cam
 
 
@@ -250,8 +304,6 @@ def load_object(object_path: str) -> None:
     print(f"Loading object from {object_path}")
     if file_extension == "blend":
         import_function(directory=object_path, link=False)
-    elif file_extension in {"glb", "gltf"}:
-        import_function(filepath=object_path, merge_vertices=True, import_shading="NORMALS")
     else:
         import_function(filepath=object_path)
 
@@ -264,10 +316,19 @@ def load_objects_and_assign_pass_index(object_paths: List[str]) -> None:
         after = set(bpy.data.objects)
         new_objs = list(after - before)
 
-        # Every mesh imported from this glb is treated as this "part"
-        for obj in new_objs:
-            if obj.type == "MESH":
-                obj.pass_index = part_idx + 1  # 0 reserved for background
+        new_mesh_objs = [o for o in (after - before) if o.type == "MESH"]
+        if not new_mesh_objs:
+            continue
+
+        bpy.ops.object.select_all(action="DESELECT")
+        for o in new_mesh_objs:
+            o.select_set(True)
+        bpy.context.view_layer.objects.active = new_mesh_objs[0]
+        bpy.ops.object.join()
+
+        joined = bpy.context.view_layer.objects.active
+        joined.name = f"part_{part_idx:04d}"
+        joined.data.name = f"part_{part_idx:04d}_mesh"
 
 
 def delete_invisible_objects() -> None:
@@ -321,7 +382,7 @@ def override_material() -> None:
     bsdf.inputs[1].default_value = 1
     output = new_mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
     new_mat.node_tree.links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
-    bpy.context.scene.view_layers["View Layer"].material_override = new_mat
+    bpy.context.scene.view_layers["ViewLayer"].material_override = new_mat
 
 
 def unhide_all_objects() -> None:
@@ -366,67 +427,59 @@ def triangulate_meshes() -> None:
     bpy.ops.object.select_all(action="DESELECT")
 
 
-def scene_bbox() -> Tuple[Vector, Vector]:
-    """Returns the bounding box of the scene.
-
-    Taken from Shap-E rendering script
-    (https://github.com/openai/shap-e/blob/main/shap_e/rendering/blender/blender_script.py#L68-L82)
-
-    Returns:
-        Tuple[Vector, Vector]: The minimum and maximum coordinates of the bounding box.
-    """
+def scene_bbox(objects=None, ignore_small_obj=False, ignore_matrix=False) -> Any:
     bbox_min = (math.inf,) * 3
     bbox_max = (-math.inf,) * 3
     found = False
-    scene_meshes = [obj for obj in bpy.context.scene.objects.values() if isinstance(obj.data, bpy.types.Mesh)]
-    for obj in scene_meshes:
+
+    for obj in objects:
+        # print(max(obj.dimensions*100))
+        if max(obj.dimensions * 100) < 0.1 and ignore_small_obj:
+            print("ignore_small_obj", obj.name, max(obj.dimensions * 100))
+            continue
         found = True
         for coord in obj.bound_box:
+            # print(coord[0], coord[1], coord[2])
             coord = Vector(coord)
-            coord = obj.matrix_world @ coord
-            bbox_min = tuple(min(x, y) for x, y in zip(bbox_min, coord))
-            bbox_max = tuple(max(x, y) for x, y in zip(bbox_max, coord))
+            if not ignore_matrix:
+                coord = obj.matrix_world @ coord
+
+            bbox_min = Vector((min(bbox_min[i], coord[i]) for i in range(3)))
+            bbox_max = Vector((max(bbox_max[i], coord[i]) for i in range(3)))
+
     if not found:
         raise RuntimeError("no objects in scene to compute bounding box for")
     return Vector(bbox_min), Vector(bbox_max)
 
 
-def normalize_scene() -> Tuple[float, Vector]:
-    """Normalizes the scene by scaling and translating it to fit in a unit cube centered
-    at the origin.
+def scene_root_objects() -> Any:
+    for obj in bpy.context.scene.objects.values():
+        if not obj.parent:
+            yield obj
 
-    Mostly taken from the Point-E / Shap-E rendering script
-    (https://github.com/openai/point-e/blob/main/point_e/evals/scripts/blender_script.py#L97-L112),
-    but fix for multiple root objects: (see bug report here:
-    https://github.com/openai/shap-e/pull/60).
 
-    Returns:
-        Tuple[float, Vector]: The scale factor and the offset applied to the scene.
-    """
-    scene_root_objects = [obj for obj in bpy.context.scene.objects.values() if not obj.parent]
-    if len(scene_root_objects) > 1:
-        # create an empty object to be used as a parent for all root objects
-        scene = bpy.data.objects.new("ParentEmpty", None)
-        bpy.context.scene.collection.objects.link(scene)
-
-        # parent all root objects to the empty object
-        for obj in scene_root_objects:
-            obj.parent = scene
-    else:
-        scene = scene_root_objects[0]
-
-    bbox_min, bbox_max = scene_bbox()
-    scale = 1 / max(bbox_max - bbox_min)
-    scene.scale = scene.scale * scale
-
-    # Apply scale to matrix_world.
+def normalize_scene(normalization_range, objects) -> Any:
+    bpy.ops.object.empty_add(type="PLAIN_AXES")
+    root_object = bpy.context.object
+    for obj in scene_root_objects():
+        if obj != root_object:
+            _matrix_world = obj.matrix_world.copy()
+            obj.parent = root_object
+            obj.matrix_world = _matrix_world
     bpy.context.view_layer.update()
-    bbox_min, bbox_max = scene_bbox()
-    offset = -(bbox_min + bbox_max) / 2
-    scene.matrix_world.translation += offset
-    bpy.ops.object.select_all(action="DESELECT")
 
-    return scale, offset
+    bbox_min, bbox_max = scene_bbox(objects)
+    scale = normalization_range / max(bbox_max - bbox_min)
+    root_object.scale *= scale
+    bpy.context.view_layer.update()
+
+    bbox_min, bbox_max = scene_bbox(objects, True)
+    mesh_offset = -(bbox_min + bbox_max) / 2
+    root_object.matrix_local.translation = mesh_offset
+    bpy.context.view_layer.update()
+
+    bpy.ops.object.select_all(action="DESELECT")
+    return root_object, bbox_max - bbox_min, scale, mesh_offset
 
 
 def get_transform_matrix(obj: bpy.types.Object) -> list:
@@ -443,33 +496,46 @@ def get_transform_matrix(obj: bpy.types.Object) -> list:
     return matrix
 
 
-def main(arg):
+def main(arg) -> None:
     os.makedirs(arg.output_folder, exist_ok=True)
 
     # Initialize context
     init_render(engine=arg.engine, resolution=arg.resolution, geo_mode=arg.geo_mode)
+
+    init_scene()
+
+    # MOD: load list of glbs, assign part_id via pass_index
+    object_paths = json.loads(arg.objects)
+    load_objects_and_assign_pass_index(object_paths)
+    if arg.split_normal:
+        split_mesh_normal()
+
     outputs, spec_nodes = init_nodes(
+        output_folder=arg.output_folder,
         save_depth=arg.save_depth,
         save_normal=arg.save_normal,
         save_albedo=arg.save_albedo,
         save_mist=arg.save_mist,
         save_mask=arg.save_mask,  # MOD
     )
-
-    # MOD: always start from clean scene (multi-glb import)
-    init_scene()
-
-    # MOD: load list of glbs, assign part_id via pass_index
-    object_paths = json.loads(arg.objects)
-    load_objects_and_assign_pass_index(object_paths)
-
-    if arg.split_normal:
-        split_mesh_normal()
+    for name, output in outputs.items():
+        output.file_slots[0].path = f"tmp_{name}_"
 
     print("[INFO] Scene initialized.")
 
     # normalize scene
-    scale, offset = normalize_scene()
+    mesh_objects = [obj for obj in bpy.context.scene.objects if obj.type == "MESH" and obj.visible_get() is True and obj.hide_get() is False]
+    normalization_range = 1.0
+    root_object, bbox_size, scale, mesh_offset = normalize_scene(normalization_range, mesh_objects)
+
+    bpy.context.view_layer.update()
+    if arg.force_rotation_deg != 0.0:
+        root_object.rotation_euler[2] = math.radians(arg.force_rotation_deg)
+
+    # camera related
+    default_camera_lens = 50.0
+    default_camera_sensor_width = 36.0
+    distance = (default_camera_lens / default_camera_sensor_width) * math.sqrt(bbox_size.x**2 + bbox_size.y**2 + bbox_size.z**2)
     print("[INFO] Scene normalized.")
 
     # Initialize camera and lighting
@@ -481,66 +547,36 @@ def main(arg):
     if arg.geo_mode:
         override_material()
 
-    # Create a list of views
-    to_export = {
-        "aabb": [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        "scale": scale,
-        "offset": [offset.x, offset.y, offset.z],
-        "frames": [],
-    }
-
     views = json.loads(arg.views)
     for i, view in enumerate(views):
+
+        view["radius"] = float(distance)
+
         cam.location = (
             view["radius"] * np.cos(view["yaw"]) * np.cos(view["pitch"]),
             view["radius"] * np.sin(view["yaw"]) * np.cos(view["pitch"]),
             view["radius"] * np.sin(view["pitch"]),
         )
-        cam.data.lens = 16 / np.tan(view["fov"] / 2)
+
+        cam.data.sensor_width = default_camera_sensor_width
+        cam.data.lens = (default_camera_sensor_width / 2.0) / math.tan(view["fov"] / 2.0)
+
+        cam.rotation_euler = (Vector((0.0, 0.0, 0.0)) - Vector(cam.location)).to_track_quat("-Z", "Y").to_euler()
+        bpy.context.view_layer.update()
 
         if arg.save_depth:
             spec_nodes["depth_map"].inputs[1].default_value = view["radius"] - 0.5 * np.sqrt(3)
             spec_nodes["depth_map"].inputs[2].default_value = view["radius"] + 0.5 * np.sqrt(3)
 
-        # MOD: output name: 0000.webp, 0001.webp, ...
-        bpy.context.scene.render.filepath = os.path.join(arg.output_folder, f"render_{i:04d}.webp")
-
-        for name, output in outputs.items():
-            output.file_slots[0].path = os.path.join(arg.output_folder, f"{name}_{i:04d}")
+        bpy.context.scene.render.filepath = os.path.join(arg.output_folder, f"color_{i:04d}.png")
 
         # Render the scene
         bpy.ops.render.render(write_still=True)
         bpy.context.view_layer.update()
-
-        # Rename compositor outputs (Blender adds frame suffix)
         for name, output in outputs.items():
             ext = EXT[output.format.file_format]
-            path = glob.glob(f"{output.file_slots[0].path}*.{ext}")[0]
-            os.rename(path, f"{output.file_slots[0].path}.{ext}")
-
-        # Save camera parameters
-        metadata = {"file_path": f"{i:04d}.webp", "camera_angle_x": view["fov"], "transform_matrix": get_transform_matrix(cam)}
-        if arg.save_depth:
-            metadata["depth"] = {"min": view["radius"] - 0.5 * np.sqrt(3), "max": view["radius"] + 0.5 * np.sqrt(3)}
-        if arg.save_mask:
-            metadata["mask_path"] = f"mask_{i:04d}.exr"
-
-        to_export["frames"].append(metadata)
-
-    # Save the camera parameters
-    if args.save_transforms:
-        with open(os.path.join(arg.output_folder, "transforms.json"), "w") as f:
-            json.dump(to_export, f, indent=4)
-
-    if arg.save_mesh:
-        # triangulate meshes
-        unhide_all_objects()
-        convert_to_meshes()
-        triangulate_meshes()
-        print("[INFO] Meshes triangulated.")
-
-        # export ply mesh
-        bpy.ops.export_mesh.ply(filepath=os.path.join(arg.output_folder, "mesh.ply"))
+            path = list(Path(arg.output_folder).glob(f"tmp_{name}_*.{ext}"))[0]
+            os.rename(path, os.path.join(arg.output_folder, f"{name}_{i:04d}.{ext}"))
 
 
 if __name__ == "__main__":
@@ -558,8 +594,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_mist", action="store_true", help="Save the mist distance maps.")
     parser.add_argument("--save_mask", action="store_true", help="Save the segmentation mask as IndexOB EXR.")
     parser.add_argument("--split_normal", action="store_true", help="Split the normals of the mesh.")
-    parser.add_argument("--save_transforms", action="store_true", help="Save metadata.")
-    parser.add_argument("--save_mesh", action="store_true", help="Save the merged mesh as a .ply file.")
+    parser.add_argument("--force_rotation_deg", type=float, default=0.0, help="Rotate normalized root object around +Z (degrees). Same role as old FORCE_ROTATION.")
 
     argv = sys.argv[sys.argv.index("--") + 1 :]
     args = parser.parse_args(argv)
