@@ -18,7 +18,7 @@ COPY ./env/install_env.sh /root/install_env.sh
 RUN export PATH="/miniconda3/bin:$PATH" && \
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main && \
     conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r && \
-    bash /root/install_env.sh --new-env --basic --xformers --flash-attn --diffoctreerast --spconv --mipgaussian --kaolin --nvdiffrast && \
+    bash /root/install_env.sh --new-env --basic --xformers --flash-attn --diffoctreerast --spconv --mipgaussian --mipgaussian --kaolin --nvdiffrast --demo && \
     rm -rf /root/.cache/*
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         xz-utils libxrender1 libxi6 libxkbcommon-x11-0 libsm6 libjpeg-dev && rm -rf /var/lib/apt/lists/*

@@ -3,7 +3,7 @@
 ```bash
 conda activate trellis
 
-SRC_DIR=~/Downloads/temp/
+SRC_DIR=~/Downloads/test_parts
 TGT_DIR=/mnt/scratch/trellis_preprocessing
 
 # step 0 get metadata from a folder that you store all the glb files
