@@ -19,8 +19,8 @@ python dataset_toolkits/render.py Partverse --output_dir ${PRE_DIR}
 python dataset_toolkits/build_metadata.py Partverse --output_dir ${PRE_DIR}
 
 # step 3, voxelize
-python dataset_toolkits/voxelize_part.py Partverse --output_dir ${PRE_DIR}
-python dataset_toolkits/voxelize_overall.py Partverse --output_dir ${PRE_DIR}
+python dataset_toolkits/voxelize_part.py --output_dir ${PRE_DIR}
+python dataset_toolkits/voxelize_overall.py --output_dir ${PRE_DIR}
 python dataset_toolkits/build_metadata.py Partverse --output_dir ${PRE_DIR}
 
 # step 4, extract dino feature

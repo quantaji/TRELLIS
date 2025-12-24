@@ -25,7 +25,14 @@ def _install_blender():
         os.system(f"tar -xvf {BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64.tar.xz -C {BLENDER_INSTALLATION_PATH}")
 
 
-def _render(file_path, sha256, output_dir, num_views):
+def _render(
+    file_path,
+    sha256,
+    output_dir,
+    num_views,
+    skip_render,
+    verbose: bool = False,
+):
     output_folder = os.path.join(output_dir, "renders", sha256)
 
     # Build camera {yaw, pitch, radius, fov}
@@ -61,10 +68,16 @@ def _render(file_path, sha256, output_dir, num_views):
     if file_path.endswith(".blend"):
         args.insert(1, file_path)
 
-    run(args, check=True)
+    if skip_render:
+        args.append("--skip_render")
+
+    if verbose:
+        run(args, check=True, stdin=DEVNULL, stdout=sys.stdout, stderr=sys.stderr)
+    else:
+        call(args, stdout=DEVNULL, stderr=DEVNULL)
 
     if os.path.exists(os.path.join(output_folder, "transforms.json")):
-        return {"sha256": sha256, "rendered": True}
+        return {"sha256": sha256, "rendered": not skip_render}
 
 
 if __name__ == "__main__":
@@ -79,6 +92,8 @@ if __name__ == "__main__":
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world_size", type=int, default=1)
     parser.add_argument("--max_workers", type=int, default=8)
+    parser.add_argument("--skip_render", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
     opt = parser.parse_args(sys.argv[2:])
     opt = edict(vars(opt))
 
@@ -120,7 +135,19 @@ if __name__ == "__main__":
     print(f"Processing {len(metadata)} objects...")
 
     # process objects
-    func = partial(_render, output_dir=opt.output_dir, num_views=opt.num_views)
-    rendered = dataset_utils.foreach_instance(metadata, opt.output_dir, func, max_workers=opt.max_workers, desc="Rendering objects")
+    func = partial(
+        _render,
+        output_dir=opt.output_dir,
+        num_views=opt.num_views,
+        skip_render=opt.skip_render,
+        verbose=opt.verbose,
+    )
+    rendered = dataset_utils.foreach_instance(
+        metadata,
+        opt.output_dir,
+        func,
+        max_workers=opt.max_workers,
+        desc="Rendering objects",
+    )
     rendered = pd.concat([rendered, pd.DataFrame.from_records(records)])
     rendered.to_csv(os.path.join(opt.output_dir, f"rendered_{opt.rank}.csv"), index=False)

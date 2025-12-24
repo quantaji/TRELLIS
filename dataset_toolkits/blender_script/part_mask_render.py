@@ -459,8 +459,18 @@ def scene_root_objects() -> Any:
 
 
 def normalize_scene(normalization_range, objects) -> Any:
+
+    bbox_min, bbox_max = scene_bbox(objects)
+    center = (bbox_min + bbox_max) / 2
+    extent = bbox_max - bbox_min
+    max_extent = max(extent)
+    scale = normalization_range / max_extent
+
     bpy.ops.object.empty_add(type="PLAIN_AXES")
     root_object = bpy.context.object
+    root_object.matrix_world.translation = center.copy()
+    bpy.context.view_layer.update()
+
     for obj in scene_root_objects():
         if obj != root_object:
             _matrix_world = obj.matrix_world.copy()
@@ -468,18 +478,19 @@ def normalize_scene(normalization_range, objects) -> Any:
             obj.matrix_world = _matrix_world
     bpy.context.view_layer.update()
 
-    bbox_min, bbox_max = scene_bbox(objects)
-    scale = normalization_range / max(bbox_max - bbox_min)
     root_object.scale *= scale
     bpy.context.view_layer.update()
 
-    bbox_min, bbox_max = scene_bbox(objects, True)
-    mesh_offset = -(bbox_min + bbox_max) / 2
-    root_object.matrix_local.translation = mesh_offset
+    root_object.matrix_world.translation = Vector((0.0, 0.0, 0.0))
     bpy.context.view_layer.update()
 
+    mesh_offset = -center
+
+    bbox_min2, bbox_max2 = scene_bbox(objects, True)
+    bbox_size2 = bbox_max2 - bbox_min2
+
     bpy.ops.object.select_all(action="DESELECT")
-    return root_object, bbox_max - bbox_min, scale, mesh_offset
+    return root_object, bbox_size2, scale, mesh_offset
 
 
 def get_transform_matrix(obj: bpy.types.Object) -> list:

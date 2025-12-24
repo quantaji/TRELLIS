@@ -17,7 +17,7 @@ from tqdm import tqdm
 def _voxelize_overall_worker(args) -> Union[None, Dict[str, Any]]:
     sha256, parts_sha256, part_ids, output_dir, filter_small_part_th = args
 
-    part_ps = [Path(output_dir) / "voxels" / f"{s}.ply" for s in parts_sha256]
+    part_ps = [Path(output_dir) / "voxels" / f"{s}_overall_centered.ply" for s in parts_sha256]
     if not all(p.exists() and p.is_file() for p in part_ps):
         print(f"Error: Not all parts exist for {sha256}")
         return None
@@ -41,7 +41,9 @@ def _voxelize_overall_worker(args) -> Union[None, Dict[str, Any]]:
     part_voxel_list, new_part_id_list = zip(*sorted_combined)
 
     overall_voxel = np.vstack(part_voxel_list)
+    overall_voxel = np.round((overall_voxel + 0.5) * 64 - 0.5).astype(np.long)
     overall_voxel = np.unique(overall_voxel, axis=0)
+    overall_voxel = (overall_voxel.astype(np.float32) + 0.5) / 64 - 0.5
 
     vox_dst = output_dir / "voxels" / f"{sha256}.ply"
     utils3d.io.write_ply(str(vox_dst), overall_voxel)
@@ -109,34 +111,52 @@ def voxelize_overall(
 
 
 if __name__ == "__main__":
-    dataset_utils = importlib.import_module(f"datasets.{sys.argv[1]}")
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the metadata")
-    dataset_utils.add_args(parser)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world_size", type=int, default=1)
     parser.add_argument("--filter_small_part_th", type=int, default=5)
-    opt = parser.parse_args(sys.argv[2:])
+    opt = parser.parse_args()
     opt = edict(vars(opt))
 
-    os.makedirs(opt.output_dir, exist_ok=True)
-    os.makedirs(os.path.join(opt.output_dir, "voxels"), exist_ok=True)
-    os.makedirs(os.path.join(opt.output_dir, "parts_ids"), exist_ok=True)
+    output_dir = Path(opt.output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    (output_dir / "voxels").mkdir(exist_ok=True, parents=True)
+    (output_dir / "parts_ids").mkdir(exist_ok=True, parents=True)
 
     # get file list
-    if not os.path.exists(os.path.join(opt.output_dir, "metadata.csv")):
+    if not ((output_dir / "metadata.csv").exists() and (output_dir / "metadata.csv").is_file()):
         raise ValueError("metadata.csv not found")
-    metadata = pd.read_csv(os.path.join(opt.output_dir, "metadata.csv"))
+    metadata = pd.read_csv(output_dir / "metadata.csv")
 
     selected_metadata = metadata[metadata["name"] == "overall"]
-
     start = len(selected_metadata) * opt.rank // opt.world_size
     end = len(selected_metadata) * (opt.rank + 1) // opt.world_size
     selected_metadata = selected_metadata[start:end]
 
+    # filter out objects that are already processed
+    records = []
+    for sha256 in copy.copy(metadata["sha256"].values):
+        if (output_dir / f"voxels/{sha256}.ply").exists():
+            pts = utils3d.io.read_ply(output_dir / f"voxels/{sha256}.ply")[0]
+            records.append(
+                {
+                    "sha256": sha256,
+                    "voxelized": True,
+                    "num_voxels": len(pts),
+                }
+            )
+            selected_metadata = selected_metadata[selected_metadata["sha256"] != sha256]
+
     print(f"Processing {len(selected_metadata)} objects...")
 
     # process objects
-    voxelize_overall_df = voxelize_overall(selected_metadata, metadata, **opt)
-    voxelize_overall_df.to_csv(os.path.join(opt.output_dir, f"voxelized_overall.csv"), index=False)
+    voxelize_overall_df = voxelize_overall(
+        selected_metadata=selected_metadata,
+        metadata=metadata,
+        **opt,
+    )
+    voxelize_overall_df = pd.concat(
+        [voxelize_overall_df, pd.DataFrame.from_records(records)],
+    )
+    voxelize_overall_df.to_csv(os.path.join(opt.output_dir, f"voxelized_overall_{opt.rank}.csv"), index=False)

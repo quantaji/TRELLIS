@@ -1,104 +1,179 @@
 # a modified version of voxelize.py for partverse
 # only parts are voxelized
 # the overal voxel should be computed after all parts
-import os
-import copy
-import sys
-import importlib
 import argparse
-import pandas as pd
-from easydict import EasyDict as edict
+import copy
+import importlib
+import json
+import os
+import sys
+from concurrent.futures import ProcessPoolExecutor
 from functools import partial
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
+
 import numpy as np
 import open3d as o3d
+import pandas as pd
 import utils3d
+from easydict import EasyDict as edict
+from tqdm import tqdm
 
 
-def _voxelize(file, sha256, output_dir):
-    mesh = o3d.io.read_triangle_mesh(os.path.join(output_dir, "renders", sha256, "mesh.ply"))
+def _voxelize_part_worker(args: Tuple[str, str, str]) -> Union[None, Dict[str, Any]]:
+    sha256, overall_sha256, output_dir = args
+    output_dir = Path(output_dir)
+
+    mesh: o3d.geometry = o3d.io.read_triangle_mesh(output_dir / f"renders/{sha256}/mesh.ply")
+
+    # transform back
+    with open(output_dir / f"renders/{sha256}/transforms.json") as f:
+        metadata = json.load(f)
+
+    scale_part = metadata["scale"]
+    offset_part = np.array(metadata["offset"])
+
+    mesh.scale(1.0 / scale_part, center=(0.0, 0.0, 0.0))
+    mesh.translate(-offset_part, relative=True)
+
+    # transform to overall
+    with open(output_dir / f"renders/{overall_sha256}/transforms.json") as f:
+        overall_metadata = json.load(f)
+
+    scale_overall = overall_metadata["scale"]
+    offset_overall = np.array(overall_metadata["offset"])
+
+    mesh.translate(offset_overall, relative=True)
+    mesh.scale(scale_overall, center=(0.0, 0.0, 0.0))
+
     # clamp vertices to the range [-0.5, 0.5]
     vertices = np.clip(np.asarray(mesh.vertices), -0.5 + 1e-6, 0.5 - 1e-6)
     mesh.vertices = o3d.utility.Vector3dVector(vertices)
-    voxel_grid = o3d.geometry.VoxelGrid.create_from_triangle_mesh_within_bounds(mesh, voxel_size=1 / 64, min_bound=(-0.5, -0.5, -0.5), max_bound=(0.5, 0.5, 0.5))
-    vertices = np.array([voxel.grid_index for voxel in voxel_grid.get_voxels()])
+    voxel_grid = o3d.geometry.VoxelGrid.create_from_triangle_mesh_within_bounds(
+        mesh,
+        voxel_size=1 / 64,
+        min_bound=(-0.5, -0.5, -0.5),
+        max_bound=(0.5, 0.5, 0.5),
+    )
+
+    vertices = np.array(
+        [voxel.grid_index for voxel in voxel_grid.get_voxels()],
+    )
     assert np.all(vertices >= 0) and np.all(vertices < 64), "Some vertices are out of bounds"
     vertices = (vertices + 0.5) / 64 - 0.5
-    utils3d.io.write_ply(os.path.join(output_dir, "voxels", f"{sha256}.ply"), vertices)
-    return {"sha256": sha256, "voxelized": True, "num_voxels": len(vertices)}
+
+    utils3d.io.write_ply(
+        output_dir / f"voxels/{sha256}_overall_centered.ply",
+        vertices,
+    )
+
+    # convert to self centered for dino feature
+    vertices_self_centered = vertices / scale_overall - offset_overall
+    vertices_self_centered = (vertices_self_centered + offset_part) * scale_part
+
+    utils3d.io.write_ply(
+        output_dir / f"voxels/{sha256}.ply",
+        vertices_self_centered,
+    )
+
+    return {
+        "sha256": sha256,
+        "voxelized": True,
+        "num_voxels": len(vertices),
+    }
+
+
+def voxelize_part(
+    selected_metadata,
+    metadata,
+    output_dir,
+    max_workers: Optional[int] = None,
+    **kwargs,
+):
+
+    # uuid to overall sha256
+    uuid_to_overall_sha256 = metadata.loc[
+        metadata["name"].eq("overall") & metadata["sha256"].notna(),
+        ["uuid", "sha256"],
+    ].set_index(
+        "uuid"
+    )["sha256"]
+    m = metadata.assign(overall_sha256=metadata["uuid"].map(uuid_to_overall_sha256))
+    part_sha256_to_overall_sha256 = dict(m.loc[m["name"].ne("overall") & m["sha256"].notna(), ["sha256", "overall_sha256"]].dropna().drop_duplicates("sha256", keep="last").itertuples(index=False, name=None))
+
+    args = []
+    for sha256 in selected_metadata["sha256"]:
+        args.append(
+            (
+                sha256,
+                part_sha256_to_overall_sha256[sha256],
+                output_dir,
+            )
+        )
+
+    max_workers = max_workers or os.cpu_count()
+    rows = []
+    with ProcessPoolExecutor(max_workers=max_workers) as ex:
+        for r in tqdm(
+            ex.map(_voxelize_part_worker, args, chunksize=64),
+            total=len(args),
+        ):
+            if r is not None:
+                rows.append(r)
+
+    return pd.DataFrame(rows)
 
 
 if __name__ == "__main__":
-    dataset_utils = importlib.import_module(f"datasets.{sys.argv[1]}")
-
     parser = argparse.ArgumentParser()
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the metadata")
-    parser.add_argument("--filter_low_aesthetic_score", type=float, default=None, help="Filter objects with aesthetic score lower than this value")
-    parser.add_argument("--instances", type=str, default=None, help="Instances to process")
-    parser.add_argument("--num_views", type=int, default=150, help="Number of views to render")
-    dataset_utils.add_args(parser)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world_size", type=int, default=1)
     parser.add_argument("--max_workers", type=int, default=None)
-    opt = parser.parse_args(sys.argv[2:])
+    opt = parser.parse_args()
     opt = edict(vars(opt))
 
-    os.makedirs(os.path.join(opt.output_dir, "voxels"), exist_ok=True)
+    output_dir = Path(opt.output_dir)
+    output_dir.mkdir(exist_ok=True, parents=True)
+    (output_dir / "voxels").mkdir(exist_ok=True, parents=True)
 
     # get file list
-    if not os.path.exists(os.path.join(opt.output_dir, "metadata.csv")):
+    if not ((output_dir / "metadata.csv").exists() and (output_dir / "metadata.csv").is_file()):
         raise ValueError("metadata.csv not found")
-    metadata = pd.read_csv(os.path.join(opt.output_dir, "metadata.csv"))
+    metadata = pd.read_csv(output_dir / "metadata.csv")
 
     # filter out all metadata that is overall
-    metadata = metadata[metadata["name"] != "overall"]
-
-    if opt.instances is None:
-        if opt.filter_low_aesthetic_score is not None:
-            metadata = metadata[metadata["aesthetic_score"] >= opt.filter_low_aesthetic_score]
-        if "rendered" not in metadata.columns:
-            raise ValueError('metadata.csv does not have "rendered" column, please run "build_metadata.py" first')
-        metadata = metadata[metadata["rendered"] == True]
-        if "voxelized" in metadata.columns:
-            metadata = metadata[metadata["voxelized"] == False]
-    else:
-        if os.path.exists(opt.instances):
-            with open(opt.instances, "r") as f:
-                instances = f.read().splitlines()
-        else:
-            instances = opt.instances.split(",")
-        metadata = metadata[metadata["sha256"].isin(instances)]
-
-    start = len(metadata) * opt.rank // opt.world_size
-    end = len(metadata) * (opt.rank + 1) // opt.world_size
-    metadata = metadata[start:end]
-    records = []
+    selected_metadata = metadata[metadata["name"] != "overall"]
+    start = len(selected_metadata) * opt.rank // opt.world_size
+    end = len(selected_metadata) * (opt.rank + 1) // opt.world_size
+    selected_metadata = selected_metadata[start:end]
 
     # filter out objects that are already processed
+    records = []
     for sha256 in copy.copy(metadata["sha256"].values):
-        if os.path.exists(os.path.join(opt.output_dir, "voxels", f"{sha256}.ply")):
-            pts = utils3d.io.read_ply(os.path.join(opt.output_dir, "voxels", f"{sha256}.ply"))[0]
-            records.append({"sha256": sha256, "voxelized": True, "num_voxels": len(pts)})
-            metadata = metadata[metadata["sha256"] != sha256]
+        if (output_dir / f"voxels/{sha256}.ply").exists():
+            pts = utils3d.io.read_ply(output_dir / f"voxels/{sha256}.ply")[0]
+            records.append(
+                {
+                    "sha256": sha256,
+                    "voxelized": True,
+                    "num_voxels": len(pts),
+                }
+            )
+            selected_metadata = selected_metadata[selected_metadata["sha256"] != sha256]
 
     print(f"Processing {len(metadata)} objects...")
 
     # process objects
-    func = partial(_voxelize, output_dir=opt.output_dir)
-    voxelized = dataset_utils.foreach_instance(metadata, opt.output_dir, func, max_workers=opt.max_workers, desc="Voxelizing")
-    voxelized = pd.concat([voxelized, pd.DataFrame.from_records(records)])
-    voxelized.to_csv(os.path.join(opt.output_dir, f"voxelized_{opt.rank}.csv"), index=False)
-
-
-BLENDER_LINK = "https://download.blender.org/release/Blender3.0/blender-3.0.1-linux-x64.tar.xz"
-BLENDER_INSTALLATION_PATH = "/tmp"
-BLENDER_PATH = f"{BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64/blender"
-
-
-def _install_blender():
-    if not os.path.exists(BLENDER_PATH):
-        os.system(f"wget {BLENDER_LINK} -P {BLENDER_INSTALLATION_PATH}")
-        os.system(f"tar -xvf {BLENDER_INSTALLATION_PATH}/blender-3.0.1-linux-x64.tar.xz -C {BLENDER_INSTALLATION_PATH}")
-
- # print(' '.join(args))
-    # call(args, stdout=DEVNULL, stderr=DEVNULL)
-    subprocess.run(args, check=True)
+    voxelize_part_df = voxelize_part(
+        selected_metadata=selected_metadata,
+        metadata=metadata,
+        **opt,
+    )
+    voxelize_part_df = pd.concat(
+        [voxelize_part_df, pd.DataFrame.from_records(records)],
+    )
+    voxelize_part_df.to_csv(
+        output_dir / f"voxelized_part_{opt.rank}.csv",
+        index=False,
+    )
