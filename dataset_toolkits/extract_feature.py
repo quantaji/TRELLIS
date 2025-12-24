@@ -16,6 +16,7 @@ from easydict import EasyDict as edict
 from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
+import shutil
 
 torch.set_grad_enabled(False)
 
@@ -58,6 +59,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world_size", type=int, default=1)
+    parser.add_argument('--remove_render', action='store_true')
     opt = parser.parse_args()
     opt = edict(vars(opt))
 
@@ -103,6 +105,11 @@ if __name__ == "__main__":
             records.append({"sha256": sha256, f"feature_{feature_name}": True})
             sha256s.remove(sha256)
 
+            if opt.remove_render:
+                render_foldder = os.path.join(opt.output_dir, 'renders', sha256)
+                if os.path.exists(render_foldder):
+                    shutil.rmtree(render_foldder, ignore_errors=True)
+
     # extract features
     load_queue = Queue(maxsize=4)
     try:
@@ -144,6 +151,12 @@ if __name__ == "__main__":
                 pack["patchtokens"] = np.mean(pack["patchtokens"], axis=0).astype(np.float16)
                 save_path = os.path.join(opt.output_dir, "features", feature_name, f"{sha256}.npz")
                 np.savez_compressed(save_path, **pack)
+
+                if opt.remove_render:
+                    render_foldder = os.path.join(opt.output_dir, 'renders', sha256)
+                    if os.path.exists(render_foldder):
+                        shutil.rmtree(render_foldder, ignore_errors=True)
+
                 records.append({"sha256": sha256, f"feature_{feature_name}": True})
 
             for _ in tqdm(range(len(sha256s)), desc="Extracting features"):
@@ -180,5 +193,13 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"Error happened during processing:\n{e}")
 
+    if opt.remove_render:
+        sha256s = list(metadata['sha256'].values)
+        for sha256 in copy.copy(sha256s):
+            render_foldder = os.path.join(opt.output_dir, 'renders', sha256)
+            if os.path.exists(render_foldder):
+                shutil.rmtree(render_foldder, ignore_errors=True)
+                
     records = pd.DataFrame.from_records(records)
     records.to_csv(os.path.join(opt.output_dir, f"feature_{feature_name}_{opt.rank}.csv"), index=False)
+

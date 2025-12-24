@@ -65,7 +65,7 @@ def voxelize_overall(
     selected_metadata,
     metadata,
     output_dir,
-    max_workers: Optional[int] = None,
+    max_workers: Optional[int] = 8,
     filter_small_part_th: int = 5,
     **kwargs,
 ) -> pd.DataFrame:
@@ -115,6 +115,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save the metadata")
     parser.add_argument("--rank", type=int, default=0)
     parser.add_argument("--world_size", type=int, default=1)
+    parser.add_argument("--max_workers", type=int, default=None)
     parser.add_argument("--filter_small_part_th", type=int, default=5)
     opt = parser.parse_args()
     opt = edict(vars(opt))

@@ -93,7 +93,8 @@ def render_worker(args: Tuple[List[str], str, Optional[int], float]) -> dict:
         str(force_rotation_deg),
     ]
 
-    subprocess.run(bargs, check=True)
+    # subprocess.run(bargs, check=True)
+    call(args, stdout=DEVNULL, stderr=DEVNULL)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(exist_ok=True, parents=True)

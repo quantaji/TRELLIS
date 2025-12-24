@@ -64,7 +64,8 @@ def _render_cond(file_path, sha256, output_dir, num_views):
     if file_path.endswith(".blend"):
         args.insert(1, file_path)
 
-    run(args, check=True)
+    # run(args, check=True)
+    call(args, stdout=DEVNULL, stderr=DEVNULL)
 
     if os.path.exists(os.path.join(output_folder, "transforms.json")):
         return {"sha256": sha256, "cond_rendered": True}

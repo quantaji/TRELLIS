@@ -112,6 +112,7 @@ if __name__ == '__main__':
     if len(df_parts) > 0:
         df = pd.concat(df_parts)
         df.set_index('sha256', inplace=True)
+        df = df[~df.index.duplicated(keep="first")]
         metadata.update(df, overwrite=True)
         for f in df_files:
             shutil.move(os.path.join(opt.output_dir, f), os.path.join(opt.output_dir, 'merged_records', f'{timestamp}_{f}'))
@@ -142,7 +143,7 @@ if __name__ == '__main__':
     if len(df_parts) > 0:
         df = pd.concat(df_parts)
         df.set_index('sha256', inplace=True)
-        df = df.loc[~df.index.duplicated(keep="last")]
+        df = df[~df.index.duplicated(keep="first")]
         metadata.update(df, overwrite=True)
         for f in df_files:
             shutil.move(os.path.join(opt.output_dir, f), os.path.join(opt.output_dir, 'merged_records', f'{timestamp}_{f}'))

@@ -59,7 +59,7 @@ def metadata_worker(input_args: Tuple[str, str, Path, Path, bool]):
 
 def get_metadata(
     partverse_dir: str,
-    max_workers: Optional[int] = None,
+    max_workers: Optional[int] = 8,
     **kwargs,
 ):
     part_level_dir = Path(partverse_dir) / "textured_part_glbs"
@@ -91,18 +91,20 @@ def get_metadata(
         ):
             if r is not None:
                 rows.append(r)
+                # print(r)
 
     return pd.DataFrame(rows)
 
 
-def download(metadata, output_dir, **kwargs) -> pd.DataFrame:
+def download(metadata, output_dir, max_workers: int = 8, **kwargs,) -> pd.DataFrame:
     output_dir = Path(output_dir)
     raw_dir = output_dir / "raw"
     os.makedirs(raw_dir, exist_ok=True)
 
     downloaded = {}
 
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor, tqdm(total=len(metadata), desc="Copying") as pbar:
+    max_workers = max_workers or os.cpu_count()
+    with ThreadPoolExecutor(max_workers=max_workers) as executor, tqdm(total=len(metadata), desc="Copying") as pbar:
 
         def worker(args: Tuple[str, str]):
             src, sha256_val = args
